@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache/
+.mypy_cache/
+
+# Virtual env
+.venv/
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+
+# Envs / secrets
+.env
+.env.*
+
+# Build & dist
+build/
+dist/
+*.egg-info/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# OneDrive temp files
+~$*
+*.tmp
