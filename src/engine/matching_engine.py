@@ -1,10 +1,11 @@
 from __future__ import annotations
+
 import itertools
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
-from src.common.types import Side, OrderType, to_decimal
+from src.common.types import OrderType, Side
 from src.engine.order import Order
 from src.engine.order_book import OrderBook, PriceLevel
 from src.engine.trade import Trade
@@ -14,35 +15,52 @@ from src.engine.trade import Trade
 class MatchResult:
     trades: List[Trade]
     fully_filled: bool
-    resting: bool 
+    resting: bool
 
 
 class MatchingEngine:
     """
-    Minimal matching brain for a SINGLE symbol.
+    Matching engine for a SINGLE symbol.
     - Strict price-time: consume best price levels first, FIFO within level.
     - Internal order protection: never skip a better price to trade at worse.
-    - Today: supports MARKET + marketable LIMIT (IOC/FOK in next steps).
+    - Supports: MARKET, LIMIT (marketable or resting), IOC, FOK.
     """
 
     def __init__(self, symbol: str) -> None:
         self.symbol = symbol
         self.book = OrderBook(symbol)
-        self._trade_seq = itertools.count(1) 
+        self._trade_seq = itertools.count(1)
 
+    # ---------- Public API ----------
 
     def submit(self, incoming: Order) -> MatchResult:
         if incoming.symbol != self.symbol:
             raise ValueError("Symbol mismatch for this engine")
 
+        if incoming.is_fok:
+            if not self._is_fully_fillable_now(incoming):
+                incoming.active = False
+                return MatchResult(trades=[], fully_filled=False, resting=False)
+
         trades: List[Trade] = []
+        original_qty = incoming.remaining
 
         if incoming.side is Side.BUY:
             trades = self._aggress(incoming, is_buy=True)
         else:
             trades = self._aggress(incoming, is_buy=False)
 
-        fully_filled = incoming.is_fully_filled()
+        executed = original_qty - incoming.remaining
+        fully_filled = incoming.remaining == Decimal("0")
+
+        if incoming.is_ioc:
+            incoming.active = False
+            incoming.remaining = Decimal("0")
+            return MatchResult(
+                trades=trades,
+                fully_filled=(executed == original_qty),
+                resting=False,
+            )
 
         rested = False
         if (not fully_filled) and incoming.is_limit:
@@ -51,6 +69,21 @@ class MatchingEngine:
 
         return MatchResult(trades=trades, fully_filled=fully_filled, resting=rested)
 
+    # ---------- Core matching (Logic for price-time priority) ----------
+    def _is_price_ok_for(self, inc: Order, is_buy: bool, best_price: Decimal) -> bool:
+        """
+        MARKET: always OK (price None).
+        LIMIT/IOC/FOK with price:
+          - BUY accepts best_price <= limit
+          - SELL accepts best_price >= limit
+        """
+        if inc.price is None:
+            return True
+
+        if is_buy:
+            return best_price <= inc.price
+        else:
+            return best_price >= inc.price
 
     def _aggress(self, inc: Order, is_buy: bool) -> List[Trade]:
         """
@@ -63,15 +96,12 @@ class MatchingEngine:
         while inc.remaining > 0:
             best = self.book.best_ask() if is_buy else self.book.best_bid()
             if best is None:
-                break  
+                break
 
             best_price, _level_qty = best
 
-            if inc.is_limit:
-                if is_buy and best_price > (inc.price or best_price):
-                    break  
-                if (not is_buy) and best_price < (inc.price or best_price):
-                    break
+            if not self._is_price_ok_for(inc, is_buy, best_price):
+                break
 
             level_map = self.book.asks if is_buy else self.book.bids
             level: Optional[PriceLevel] = level_map.get(best_price)
@@ -81,10 +111,12 @@ class MatchingEngine:
             while inc.remaining > 0:
                 head = level.front()
                 if head is None:
-                    del level_map[best_price]
+                    if best_price in level_map:
+                        del level_map[best_price]
                     break
 
                 take = min(inc.remaining, head.remaining)
+
                 level.deduct_from_front(take)
                 inc.reduce(take)
 
@@ -100,10 +132,42 @@ class MatchingEngine:
                 )
                 trades.append(t)
 
-                if level.front() is None:
-                    if best_price in level_map:
-                        if level.total_qty <= Decimal("0"):
-                            del level_map[best_price]
-                    break 
-
         return trades
+
+    # ---------- FOK availability pre-check ----------
+
+    def _is_fully_fillable_now(self, inc: Order) -> bool:
+        """
+        Check if the *entire* quantity of 'inc' can be filled immediately
+        at prices that respect the order's limit (if any).
+        MARKET FOK: aggregate across all prices on the opposite book.
+        LIMIT FOK: only aggregate up to the limit price (<= for buys, >= for sells).
+        """
+        need = inc.remaining
+
+        if inc.side is Side.BUY:
+            total = Decimal("0")
+            for i in range(len(self.book.asks)):
+                price, level = self.book.asks.peekitem(i)
+                level.pop_front_if_empty()
+                if level.total_qty <= 0:
+                    continue
+                if inc.is_limit and inc.price is not None and price > inc.price:
+                    break
+                total += level.total_qty
+                if total >= need:
+                    return True
+            return False
+        else:
+            total = Decimal("0")
+            for i in range(1, len(self.book.bids) + 1):
+                price, level = self.book.bids.peekitem(-i)
+                level.pop_front_if_empty()
+                if level.total_qty <= 0:
+                    continue
+                if inc.is_limit and inc.price is not None and price < inc.price:
+                    break
+                total += level.total_qty
+                if total >= need:
+                    return True
+            return False
