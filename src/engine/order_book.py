@@ -56,6 +56,38 @@ class PriceLevel:
         o = self.queue.popleft()
         self.total_qty -= o.remaining
         return o
+    
+    def front(self) -> Order | None:
+        """Return the FIFO-front order (skipping any zero-remaining)."""
+        while self.queue and self.queue[0].remaining == 0:
+            self.queue.popleft()  # already accounted in total_qty elsewhere
+        return self.queue[0] if self.queue else None
+
+    def deduct_from_front(self, qty: Decimal) -> Order | None:
+        """
+        Reduce remaining of the front order by qty, adjust total_qty,
+        and pop it if fully filled. Returns the (possibly filled) order.
+        """
+        if not self.queue:
+            return None
+        while self.queue and self.queue[0].remaining == 0:
+            self.queue.popleft()
+        if not self.queue:
+            return None
+
+        o = self.queue[0]
+        if qty <= 0:
+            return o
+
+        take = min(o.remaining, qty)
+        self.total_qty -= take
+        o.reduce(take)
+
+        if o.remaining == 0:
+            self.queue.popleft()  
+
+        return o
+
 
 
 class OrderBook:
