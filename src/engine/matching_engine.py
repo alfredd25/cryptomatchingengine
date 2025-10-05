@@ -171,3 +171,36 @@ class MatchingEngine:
                 if total >= need:
                     return True
             return False
+    
+    def bbo(self) -> dict:
+        """
+        Return current Best Bid/Offer in a JSON-friendly structure:
+        {
+          "bid": {"price": "62100", "qty": "0.5"} | None,
+          "ask": {"price": "62200", "qty": "0.7"} | None
+        }
+        """
+        bb = self.book.best_bid()
+        ba = self.book.best_ask()
+        def pack(p):
+            return None if p is None else {"price": str(p[0]), "qty": str(p[1])}
+        return {"bid": pack(bb), "ask": pack(ba)}
+
+    def l2(self, top_n: int = 10) -> dict:
+        """
+        Return top-N depth snapshot:
+        {
+          "bids": [["price","qty"], ...],  # highest -> lower
+          "asks": [["price","qty"], ...]   # lowest -> higher
+        }
+        """
+        from src.common.types import Side
+
+        bids = self.book.depth(Side.BUY, top_n=top_n)
+        asks = self.book.depth(Side.SELL, top_n=top_n)
+
+    
+        return {
+            "bids": [list(x) for x in bids],
+            "asks": [list(x) for x in asks],
+        }
