@@ -9,6 +9,9 @@ from src.common.types import OrderType, Side
 from src.engine.order import Order
 from src.engine.order_book import OrderBook, PriceLevel
 from src.engine.trade import Trade
+from src.common.logging import get_logger
+
+LOGGER = get_logger("engine.match")
 
 
 @dataclass
@@ -31,20 +34,40 @@ class MatchingEngine:
         self.book = OrderBook(symbol)
         self._trade_seq = itertools.count(1)
 
-    # ---------- Public API ----------
+    #Public API
 
     def submit(self, incoming: Order) -> MatchResult:
         if incoming.symbol != self.symbol:
             raise ValueError("Symbol mismatch for this engine")
 
+        LOGGER.info(
+            "submit_start symbol=%s type=%s side=%s qty=%s price=%s order_id=%s",
+            incoming.symbol,
+            incoming.order_type.value,
+            incoming.side.value,
+            str(incoming.quantity),
+            "None" if incoming.price is None else str(incoming.price),
+            str(incoming.order_id),
+        )
+
+        #FOK
         if incoming.is_fok:
             if not self._is_fully_fillable_now(incoming):
                 incoming.active = False
+                LOGGER.info(
+                    "submit_end symbol=%s type=fok side=%s status=%s trades=%s order_id=%s",
+                    incoming.symbol,
+                    incoming.side.value,
+                    "killed",
+                    0,
+                    str(incoming.order_id),
+                )
                 return MatchResult(trades=[], fully_filled=False, resting=False)
 
         trades: List[Trade] = []
         original_qty = incoming.remaining
 
+        #Match
         if incoming.side is Side.BUY:
             trades = self._aggress(incoming, is_buy=True)
         else:
@@ -53,23 +76,63 @@ class MatchingEngine:
         executed = original_qty - incoming.remaining
         fully_filled = incoming.remaining == Decimal("0")
 
+        #IOC
         if incoming.is_ioc:
             incoming.active = False
             incoming.remaining = Decimal("0")
+            LOGGER.info(
+                "submit_end symbol=%s type=ioc side=%s status=%s trades=%s order_id=%s",
+                incoming.symbol,
+                incoming.side.value,
+                "filled" if (executed == original_qty) else "partial_or_none",
+                len(trades),
+                str(incoming.order_id),
+            )
             return MatchResult(
                 trades=trades,
                 fully_filled=(executed == original_qty),
                 resting=False,
             )
 
+        #FOK success path
+        if incoming.is_fok:
+            incoming.active = False
+            incoming.remaining = Decimal("0")
+            LOGGER.info(
+                "submit_end symbol=%s type=fok side=%s status=%s trades=%s order_id=%s",
+                incoming.symbol,
+                incoming.side.value,
+                "filled" if (executed == original_qty) else "killed_partial",
+                len(trades),
+                str(incoming.order_id),
+            )
+            return MatchResult(
+                trades=trades,
+                fully_filled=(executed == original_qty),
+                resting=False,
+            )
+
+        #Regular MARKET/LIMIT
         rested = False
         if (not fully_filled) and incoming.is_limit:
             self.book.add_order(incoming)
             rested = True
 
+        LOGGER.info(
+            "submit_end symbol=%s type=%s side=%s fully_filled=%s resting=%s trades=%s order_id=%s",
+            incoming.symbol,
+            incoming.order_type.value,
+            incoming.side.value,
+            fully_filled,
+            rested,
+            len(trades),
+            str(incoming.order_id),
+        )
+
         return MatchResult(trades=trades, fully_filled=fully_filled, resting=rested)
 
-    # ---------- Core matching (Logic for price-time priority) ----------
+
+    #Core matching (Logic for price-time priority) 
     def _is_price_ok_for(self, inc: Order, is_buy: bool, best_price: Decimal) -> bool:
         """
         MARKET: always OK (price None).
@@ -131,45 +194,53 @@ class MatchingEngine:
                     taker_order_id=str(inc.order_id),
                 )
                 trades.append(t)
+                LOGGER.info(
+                    "trade_print symbol=%s trade_id=%s price=%s qty=%s aggr=%s maker=%s taker=%s",
+                    self.symbol,
+                    t.trade_id,
+                    str(t.price),
+                    str(t.qty),
+                    t.aggressor_side,
+                    t.maker_order_id,
+                    t.taker_order_id,
+                )
+
 
         return trades
 
-    # ---------- FOK availability pre-check ----------
-
+    #FOK availability pre-check
     def _is_fully_fillable_now(self, inc: Order) -> bool:
         """
-        Check if the *entire* quantity of 'inc' can be filled immediately
-        at prices that respect the order's limit (if any).
-        MARKET FOK: aggregate across all prices on the opposite book.
-        LIMIT FOK: only aggregate up to the limit price (<= for buys, >= for sells).
+        Decide if 'inc' can be entirely filled right now, without mutating the book.
+
+        BUY  -> walk ASKS low->high, include prices <= limit (if set)
+        SELL -> walk BIDS high->low, include prices >= limit (if set)
+
+        Aggregate *per-order* remaining in FIFO at each level.
+        Return True as soon as cumulative >= needed.
         """
         need = inc.remaining
 
         if inc.side is Side.BUY:
-            total = Decimal("0")
-            for i in range(len(self.book.asks)):
-                price, level = self.book.asks.peekitem(i)
-                level.pop_front_if_empty()
-                if level.total_qty <= 0:
-                    continue
-                if inc.is_limit and inc.price is not None and price > inc.price:
+            for price, level in self.book.asks.items():
+                if inc.price is not None and price > inc.price:
                     break
-                total += level.total_qty
-                if total >= need:
-                    return True
+                for o in level.queue:
+                    if o.remaining > 0:
+                        need -= o.remaining
+                        if need <= 0:
+                            return True
             return False
+
         else:
-            total = Decimal("0")
-            for i in range(1, len(self.book.bids) + 1):
-                price, level = self.book.bids.peekitem(-i)
-                level.pop_front_if_empty()
-                if level.total_qty <= 0:
-                    continue
-                if inc.is_limit and inc.price is not None and price < inc.price:
+            for price, level in reversed(self.book.bids.items()):
+                if inc.price is not None and price < inc.price:
                     break
-                total += level.total_qty
-                if total >= need:
-                    return True
+                for o in level.queue:
+                    if o.remaining > 0:
+                        need -= o.remaining
+                        if need <= 0:
+                            return True
             return False
     
     def bbo(self) -> dict:

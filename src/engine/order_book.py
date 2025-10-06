@@ -9,6 +9,9 @@ from sortedcontainers import SortedDict
 
 from src.common.types import Side, to_decimal
 from src.engine.order import Order
+from src.common.logging import get_logger
+
+LOGGER = get_logger("engine.order_book")
 
 
 @dataclass
@@ -130,6 +133,15 @@ class OrderBook:
             level.append(order)
 
         self._index[str(order.order_id)] = (order.side, order.price or Decimal("0"), order)
+        LOGGER.info(
+            "ob_add symbol=%s side=%s price=%s qty=%s seq=%s order_id=%s",
+            self.symbol,
+            order.side.value,
+            str(order.price),
+            str(order.remaining),
+            order.seq,
+            str(order.order_id),
+        )
 
     def cancel_order(self, order_id: str) -> bool:
         """
@@ -154,6 +166,15 @@ class OrderBook:
 
         if level.pop_front_if_empty():
             del book[price]
+        
+        LOGGER.info(
+            "ob_cancel symbol=%s side=%s price=%s order_id=%s",
+            self.symbol,
+            side.value,
+            str(price),
+            order_id,
+        )
+
         return True
 
 
