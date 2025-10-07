@@ -28,15 +28,13 @@ from src.engine.order_book import OrderBook
 
 app = FastAPI(title="Crypto Matching Engine", version="0.1.0")
 
-# -----------------------------
-# Logging & CORS
-# -----------------------------
+#Logging 
+
 LOGGER = setup_logging()
 
-# Allow local tools by default; adjust later for prod
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in production
+    allow_origins=["*"],   
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,7 +42,6 @@ app.add_middleware(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    # minimal structured access log
     path = request.url.path
     method = request.method
     try:
@@ -57,9 +54,8 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-# -----------------------------
-# Engines (single symbol for now)
-# -----------------------------
+
+
 SUPPORTED_SYMBOLS = {"BTC-USDT"}
 _engines: dict[str, MatchingEngine] = {s: MatchingEngine(s) for s in SUPPORTED_SYMBOLS}
 
@@ -70,16 +66,10 @@ def _engine_for(symbol: str) -> MatchingEngine:
     return _engines[symbol]
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-# -----------------------------
-# Simple PubSub (in-memory)
-# -----------------------------
 class PubSub:
     def __init__(self) -> None:
         self._subs: Set[asyncio.Queue] = set()
@@ -108,9 +98,6 @@ _orderbook_feeds: dict[str, PubSub] = {s: PubSub() for s in SUPPORTED_SYMBOLS}
 _trade_feeds: dict[str, PubSub] = {s: PubSub() for s in SUPPORTED_SYMBOLS}
 
 
-# -----------------------------
-# Error handlers (consistent JSON shape)
-# -----------------------------
 @app.exception_handler(HTTPException)
 async def http_exc_handler(_: Request, exc: HTTPException):
     return JSONResponse(
@@ -120,7 +107,6 @@ async def http_exc_handler(_: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exc_handler(_: Request, exc: RequestValidationError):
-    # Surface first error succinctly (keep full exc.body if you want)
     first = exc.errors()[0] if exc.errors() else {"msg": "validation error"}
     return JSONResponse(
         status_code=422,
@@ -128,9 +114,6 @@ async def validation_exc_handler(_: Request, exc: RequestValidationError):
     )
 
 
-# -----------------------------
-# REST
-# -----------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -153,11 +136,9 @@ def get_orderbook(symbol: str = Query(..., examples=["BTC-USDT"]), top_n: int = 
 
 @app.post("/orders", response_model=OrderSubmitResult, status_code=201)
 def submit_order(payload: OrderSubmit, background_tasks: BackgroundTasks):
-    # Validation: symbol supported
     if payload.symbol not in SUPPORTED_SYMBOLS:
         raise HTTPException(status_code=400, detail=f"unsupported symbol: {payload.symbol}")
 
-    # Validation: priced order types must provide price
     needs_price = payload.order_type in ("limit", "ioc", "fok")
     if needs_price and payload.price is None:
         raise HTTPException(status_code=400, detail="price is required for limit/ioc/fok orders")
@@ -198,7 +179,6 @@ def submit_order(payload: OrderSubmit, background_tasks: BackgroundTasks):
             LOGGER.info("trade_print id=%s symbol=%s px=%s qty=%s aggr=%s maker=%s taker=%s",
                         t.trade_id, t.symbol, t.price, t.qty, t.aggressor_side, t.maker_order_id, t.taker_order_id)
 
-    # Broadcast L2 after order
     snap = eng.l2(top_n=10)
     ob_msg = {
         "timestamp": _ts(),
@@ -237,7 +217,6 @@ def cancel_order(order_id: str, symbol: str = Query(..., examples=["BTC-USDT"]),
     if not ok:
         raise HTTPException(status_code=404, detail=f"order not found or not cancelable: {order_id}")
 
-    # Broadcast snapshot after cancel
     snap = eng.l2(top_n=10)
     ob_msg = {
         "timestamp": _ts(),
@@ -252,9 +231,6 @@ def cancel_order(order_id: str, symbol: str = Query(..., examples=["BTC-USDT"]),
     return {"status": "canceled", "order_id": order_id}
 
 
-# -----------------------------
-# WebSockets
-# -----------------------------
 @app.websocket("/ws/orderbook")
 async def ws_orderbook(ws: WebSocket, symbol: str, top_n: int = 10):
     if symbol not in SUPPORTED_SYMBOLS:
@@ -266,7 +242,6 @@ async def ws_orderbook(ws: WebSocket, symbol: str, top_n: int = 10):
 
     await ws.accept()
 
-    # Initial snapshot
     eng = _engine_for(symbol)
     snap = eng.l2(top_n=top_n)
     await ws.send_json({

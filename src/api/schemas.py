@@ -5,7 +5,7 @@ from typing import Literal, Optional, List
 from pydantic import BaseModel, Field, field_validator
 
 
-# ----- Requests -----
+#Requests
 
 class OrderSubmit(BaseModel):
     symbol: str = Field(examples=["BTC-USDT"])
@@ -29,7 +29,7 @@ class OrderSubmit(BaseModel):
         return v
 
 
-# ----- Responses -----
+#Responses
 
 class TradeReport(BaseModel):
     timestamp: datetime
