@@ -31,8 +31,7 @@ class PriceLevel:
 
     def remove(self, order: Order) -> None:
         """
-        Remove a specific order from the queue (O(n) scan).
-        For now this is acceptable; we can optimize later if needed.
+        Remove a specific order from the queue
         """
         removed = False
         new_q: Deque[Order] = deque()
@@ -63,7 +62,7 @@ class PriceLevel:
     def front(self) -> Order | None:
         """Return the FIFO-front order (skipping any zero-remaining)."""
         while self.queue and self.queue[0].remaining == 0:
-            self.queue.popleft()  # already accounted in total_qty elsewhere
+            self.queue.popleft()  
         return self.queue[0] if self.queue else None
 
     def deduct_from_front(self, qty: Decimal) -> Order | None:

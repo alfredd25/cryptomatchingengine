@@ -11,22 +11,72 @@ from fastapi import (
     Query,
     WebSocket,
     WebSocketDisconnect,
-    BackgroundTasks,
     Request,
+    Header,
+    BackgroundTasks,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from starlette.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
-from src.api.schemas import OrderSubmit, OrderSubmitResult, TradeReport, BBO, L2Depth
-from src.common.logging import setup_logging, get_logger
-from src.common.types import OrderType, Side
+from src.common.types import Side, OrderType, to_decimal
 from src.engine.matching_engine import MatchingEngine
 from src.engine.order import Order
+from src.api.schemas import (
+    OrderSubmit,
+    OrderSubmitResponse,
+    OrderBookDepthResponse,
+    BBOResponse,
+    TradeFeedMessage,
+    DepthFeedMessage,
+)
+from src.common.logging import setup_logging
+from src.infrastructure.db import init_db, close_db
+from src.infrastructure.event_store import EventStore
+from src.application.order_service import OrderService, get_engine, get_logger
 from src.engine.order_book import OrderBook
 
 
-app = FastAPI(title="Crypto Matching Engine", version="0.1.0")
+SUPPORTED_SYMBOLS = {"BTC-USDT"}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Initialize DB Connection pool & Tables
+    await init_db()
+    
+    # 2. Replay historical events deterministically
+    LOGGER.info("Starting WAL event replay...")
+    events = await EventStore.fetch_all_events()
+    for row in events:
+        sym = row["symbol"]
+        if sym not in SUPPORTED_SYMBOLS:
+            continue
+            
+        engine = get_engine(sym)
+        event_type = row["event_type"]
+        
+        if event_type == "ORDER_PLACED":
+             engine.submit(Order(
+                 order_id=row["order_id"],
+                 symbol=sym,
+                 side=Side(row["side"]),
+                 order_type=OrderType(row["order_type"]),
+                 quantity=row["quantity"],
+                 price=row["price"]
+             ))
+        elif event_type == "ORDER_CANCELLED":
+             engine.cancel(str(row["order_id"]))
+             
+    LOGGER.info(f"Replayed {len(events)} events successfully. Engine is ready.")
+    
+    yield
+    
+    # 3. Shutdown
+    await close_db()
+
+
+app = FastAPI(title="Crypto Matching Engine", version="0.1.0", lifespan=lifespan)
 
 #Logging 
 
@@ -61,9 +111,9 @@ _engines: dict[str, MatchingEngine] = {s: MatchingEngine(s) for s in SUPPORTED_S
 
 
 def _engine_for(symbol: str) -> MatchingEngine:
-    if symbol not in _engines:
-        raise HTTPException(status_code=400, detail=f"unsupported symbol: {symbol}")
-    return _engines[symbol]
+    if symbol not in SUPPORTED_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"Unsupported symbol {symbol}")
+    return get_engine(symbol)
 
 
 def _ts() -> str:
@@ -119,116 +169,111 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/bbo", response_model=BBO)
+@app.get("/bbo", response_model=BBOResponse)
 def get_bbo(symbol: str = Query(..., examples=["BTC-USDT"])):
     eng = _engine_for(symbol)
     return eng.bbo()
 
 
-@app.get("/orderbook", response_model=L2Depth)
+@app.get("/orderbook", response_model=OrderBookDepthResponse)
 def get_orderbook(symbol: str = Query(..., examples=["BTC-USDT"]), top_n: int = 10):
     if top_n <= 0 or top_n > 100:
         raise HTTPException(status_code=400, detail="top_n must be between 1 and 100")
     eng = _engine_for(symbol)
     snap = eng.l2(top_n=top_n)
-    return L2Depth(symbol=symbol, bids=snap["bids"], asks=snap["asks"])
+    return OrderBookDepthResponse(symbol=symbol, bids=snap["bids"], asks=snap["asks"])
 
 
-@app.post("/orders", response_model=OrderSubmitResult, status_code=201)
-def submit_order(payload: OrderSubmit, background_tasks: BackgroundTasks):
+@app.post("/submit", response_model=Dict[str, Any])
+async def submit_order(
+    payload: OrderSubmit, 
+    background_tasks: BackgroundTasks,
+    idempotency_key: str = Header(..., description="Unique key for idempotent processing")
+):
+    """
+    1. Parse validation
+    2. Delegate to OrderService to write append-log via Postgres Tx
+    3. Apply to engine
+    4. Emit async websockets if trades happen
+    """
     if payload.symbol not in SUPPORTED_SYMBOLS:
-        raise HTTPException(status_code=400, detail=f"unsupported symbol: {payload.symbol}")
+        raise HTTPException(status_code=400, detail="Invalid symbol")
 
-    needs_price = payload.order_type in ("limit", "ioc", "fok")
-    if needs_price and payload.price is None:
-        raise HTTPException(status_code=400, detail="price is required for limit/ioc/fok orders")
+    qty = to_decimal(payload.quantity)
+    px = to_decimal(payload.price) if payload.price else None
 
-    order_id = str(uuid.uuid4())
-    otype = OrderType(payload.order_type)
-    side = Side(payload.side)
+    # Limit orders MUST have price
+    if payload.order_type in (OrderType.LIMIT, OrderType.MAKER_ONLY) and px is None:
+        raise HTTPException(status_code=400, detail="Limit orders require a price")
 
-    order = Order(
-        order_id=order_id,
-        symbol=payload.symbol,
-        side=side,
-        order_type=otype,
-        quantity=payload.quantity,
-        price=payload.price,
+    result_dict = await OrderService.place_order(
+         symbol=payload.symbol,
+         side=payload.side,
+         order_type=payload.order_type,
+         quantity=qty,
+         price=px,
+         idempotency_key=idempotency_key
     )
+    
+    # If the response indicates this wasn't purely idempotent skip (duplicate)
+    # We broadcast the depth updates and public trades
+    if result_dict.get("status") == "Accepted":
+        engine = get_engine(payload.symbol)
+        
+        trades = result_dict.get("trades", [])
+        if trades:
+             for t in trades:
+                 msg: TradeFeedMessage = {
+                     "type": "trade",
+                     "symbol": payload.symbol,
+                     "trade_id": t["trade_id"],
+                     "price": t["price"],
+                     "qty": t["qty"],
+                     "maker_order_id": t["maker_order_id"],
+                     "taker_order_id": result_dict["order_id"],
+                     "ts": _ts(),
+                     "aggressor_side": t["aggressor_side"]
+                 }
+                 background_tasks.add_task(_trade_feeds[payload.symbol].publish, msg)
+                 
+        # Depth update
+        bbo = engine.bbo()
+        ob_msg: DepthFeedMessage = {
+            "type": "bbo",
+            "symbol": payload.symbol,
+            "bbo": bbo,
+            "ts": _ts()
+        }
+        background_tasks.add_task(_orderbook_feeds[payload.symbol].publish, ob_msg)
 
-    eng = _engine_for(payload.symbol)
-    LOGGER.info("order_submit id=%s symbol=%s type=%s side=%s qty=%s price=%s",
-                order_id, payload.symbol, payload.order_type, payload.side, payload.quantity, payload.price)
-
-    res = eng.submit(order)
-
-    if res.trades:
-        feed = _trade_feeds[payload.symbol]
-        for t in res.trades:
-            msg = {
-                "timestamp": _ts(),
-                "symbol": t.symbol,
-                "trade_id": t.trade_id,
-                "price": str(t.price),
-                "quantity": str(t.qty),
-                "aggressor_side": t.aggressor_side,
-                "maker_order_id": t.maker_order_id,
-                "taker_order_id": t.taker_order_id,
-            }
-            background_tasks.add_task(feed.publish, msg)
-            LOGGER.info("trade_print id=%s symbol=%s px=%s qty=%s aggr=%s maker=%s taker=%s",
-                        t.trade_id, t.symbol, t.price, t.qty, t.aggressor_side, t.maker_order_id, t.taker_order_id)
-
-    snap = eng.l2(top_n=10)
-    ob_msg = {
-        "timestamp": _ts(),
-        "symbol": payload.symbol,
-        "asks": snap["asks"],
-        "bids": snap["bids"],
-    }
-    background_tasks.add_task(_orderbook_feeds[payload.symbol].publish, ob_msg)
-
-    trades = [
-        TradeReport(
-            timestamp=t.ts,
-            symbol=t.symbol,
-            trade_id=t.trade_id,
-            price=str(t.price),
-            quantity=str(t.qty),
-            aggressor_side=t.aggressor_side,
-            maker_order_id=t.maker_order_id,
-            taker_order_id=t.taker_order_id,
-        )
-        for t in res.trades
-    ]
-
-    return OrderSubmitResult(
-        order_id=order_id,
-        fully_filled=res.fully_filled,
-        resting=res.resting,
-        trades=trades,
-    )
+    return result_dict
 
 
-@app.delete("/orders/{order_id}")
-def cancel_order(order_id: str, symbol: str = Query(..., examples=["BTC-USDT"]), background_tasks: BackgroundTasks = None):
-    eng = _engine_for(symbol)
-    ok = eng.book.cancel_order(order_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"order not found or not cancelable: {order_id}")
-
-    snap = eng.l2(top_n=10)
-    ob_msg = {
-        "timestamp": _ts(),
+@app.delete("/cancel/{order_id}")
+async def cancel_order(
+    order_id: str, 
+    symbol: str = Query(..., examples=["BTC-USDT"]),
+    background_tasks: BackgroundTasks = None
+):
+    if symbol not in SUPPORTED_SYMBOLS:
+         raise HTTPException(status_code=400, detail="Invalid symbol")
+         
+    success = await OrderService.cancel_order(symbol, order_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Order not found or already filled")
+        
+    engine = get_engine(symbol)
+    bbo = engine.bbo()
+    ob_msg: DepthFeedMessage = {
+        "type": "bbo",
         "symbol": symbol,
-        "asks": snap["asks"],
-        "bids": snap["bids"],
+        "bbo": bbo,
+        "ts": _ts()
     }
-    if background_tasks is not None:
+    if background_tasks:
         background_tasks.add_task(_orderbook_feeds[symbol].publish, ob_msg)
 
-    LOGGER.info("order_cancel id=%s symbol=%s", order_id, symbol)
-    return {"status": "canceled", "order_id": order_id}
+    return {"status": "cancelled", "order_id": order_id}
 
 
 @app.websocket("/ws/orderbook")

@@ -17,7 +17,7 @@ def test_limit_order_creation():
     assert o.remaining == Decimal("0.5")
     assert o.price == Decimal("62000.10")
     assert o.active is True
-    assert o.seq == 0  # set later by order book
+    assert o.seq == 0  
 
 
 def test_market_disallows_price():
@@ -27,7 +27,7 @@ def test_market_disallows_price():
         side=Side.SELL,
         order_type=OrderType.MARKET,
         quantity="1.0",
-        price=None,  # allowed
+        price=None, 
     )
     assert o.price is None
 
