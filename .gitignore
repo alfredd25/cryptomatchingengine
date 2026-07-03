@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.pytest_cache/
 .mypy_cache/
+*docs/interview_prep_guide.md
 
 # Virtual env
 .venv/
